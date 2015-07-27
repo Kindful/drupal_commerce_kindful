@@ -1,0 +1,257 @@
+<?php
+
+/**
+ * @file
+ * Implements Kindful payment processing for use with Drupal Commerce.
+ */
+
+
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_kindful_menu() {
+  $items = array();
+  
+  // Define an always accessible path to receive transactions.
+  $items['commerce_kindful/callback'] = array(
+    'page callback' => 'commerce_kindful_callback',
+    'page arguments' => array(),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  // define a webhook endpoint for changing transaction information
+  $items['commerce_kindful/webhook'] = array(
+    'page callback' => 'commerce_kindful_webhook',
+    'page arguments' => array(),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_kindful.webhook.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_kindful_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $display_title = t('Credit Card');
+
+  $payment_methods['kindful'] = array(
+    'base' => 'commerce_kindful',
+    'title' => t('Kindful'),
+    'short_title' => t('Kindful'),
+    'display_title' => $display_title,
+    'description' => t('Kindful'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implements CALLBACK_commerce_payment_method_submit_form().
+ * 
+ * Asks for donation schedule (what day of the month funds should be withdrawn)
+ *
+ */ 
+function commerce_kindful_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  
+  // set up the radio button options
+  $options = array( 1 => '1st', 2 => '5th', 3 => '10th', 4 => '20th');
+  
+
+  // build the form field
+  $form = array(
+   $form['schedule'] = array(
+    '#type' => 'radios',
+    '#title' => t('Donation Schedule'),
+    '#options' => $options,
+    '#description' => t('What day of the month should we withdraw funds from your account? Note: If that day has passed for the current month, Kindful will not withdraw funds until the next month.'),
+    '#required' => TRUE,
+    ),
+  );
+  return $form;
+}
+
+/**
+ * Implements CALLBACK_commerce_payment_method_submit_form_validate().
+ */ 
+function commerce_kindful_submit_form_submit($payment_method, $pane_values, $checkout_pane, $order) {
+  // grab the onetime/recurring option data and tack it onto  $order
+  $order->data['schedule'] = $checkout_pane[0];
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_kindful_settings_form($settings = array()) {
+  $form = array();
+  // stored settings array.
+  $settings = (array) $settings;
+  
+  // grab the organization ID
+  $form['kindful_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Kindful URL'),
+    '#description' => t('The URL to use for connecting to Kindful.'),
+    '#default_value' => $settings['kindful_url'],
+    '#required' => TRUE,
+  );
+  // grab the organization ID
+  $form['organization_ID'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Organization ID'),
+    '#description' => t('The Organization ID for your Kindful account.'),
+    '#default_value' => $settings['organization_ID'],
+    '#required' => TRUE,
+  );
+  // grab the campaign ID
+  // TODO: verify that this can be set on a rule by rule basis
+  $form['campaign_ID'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default Campaign ID'),
+    '#description' => t('The default campaign ID you want to use at Kindful.'),
+    '#default_value' => $settings['campaign_ID'],
+    '#required' => TRUE,
+  );
+  // Set the string for payment processing option
+  $form['paystring'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Payment Label'),
+    '#description' => t('What do you want people to see for their payment option?'),
+    '#default_value' => $settings['paystring'],
+    '#required' => TRUE,
+  );
+ 
+  return $form;
+}
+
+/**
+ * Implements CALLBACK_commerce_payment_method_redirect_form()
+ * 
+ * sets up the redirect POST request and form action URL for redirect to Kindful
+ * 
+ */
+function commerce_kindful_redirect_form($form, &$form_state, $order, $payment_method) {
+  
+  // grab the user email address
+  $email = $form_state['build_info']['args'][0]->mail;
+   // get the order info
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  
+  // grab the product information
+  foreach($wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if($line_item_wrapper->type->value() == 'product') {
+      $product = $line_item_wrapper->commerce_product->value();
+      $index = $delta + 1;
+      // find products display node so we can find the child's town
+      $display_node_id = commerce_kindful_get_referencing_node_id($product->product_id);
+      $display_node = node_load($display_node_id);
+      if(!empty($display_node->field_town['und'])) {
+        $town_id = $display_node->field_town['und'][0]['tid'];
+        $town = taxonomy_term_load($town_id);
+        $campaign_id = $town->field_campaign_id['und'][0]['value'];
+      } else {
+        // TODO: need to set default campaign
+        $campaign_id = 'XXXX'; 
+      }
+      $cart_products['items'][$index] = array(
+        "product_id" => $product->sku, 
+        "desc" => $product->title,
+        "quantity" => (int) $line_item_wrapper->quantity->value(), 
+        "amount"=> commerce_currency_amount_to_decimal($product->commerce_price[LANGUAGE_NONE][0]['amount'], 'USD'),
+        "campaign_id" => $campaign_id,
+      ); 
+    }
+  }
+  $cart_products['desc'] = 'Child Sponsorship';
+  
+  // sets up the return URLS for canceled transactions or successful returns
+  $settings = array(
+    // Return to the previous page when payment is canceled
+    'cancel_return' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Return to the payment redirect page for processing successful payments
+    'return' => url('commerce_kindful/callback', array('query' => array('order' => $order->order_id, 'key' => $order->data['payment_redirect_key']), 'absolute' => TRUE)),
+
+    // Specify the current payment method instance ID in the notify_url
+    'payment_method' => $payment_method['instance_id'],
+  );
+  
+  // grab the payment method settings and put them in their own array
+  $settings += $payment_method['settings'];
+  // $campaign = $settings['campaign_ID'];
+  
+  // build the array for the query string and the form POST
+  $data = array(
+    'organization_ID' => $settings['organization_ID'],
+    'source_ID' => 2,
+    'order_ID' => $order->order_id,
+    'campaign_ID' => $cart_products['items'][1]['campaign_id'],
+    'success_URL' => $settings['return'],
+    'schedule' => $order->data['schedule'],
+    'cart' => $cart_products,
+    'email' => $email,
+  );
+  
+  // set up the redirection URL
+  $form['#action'] = url($settings['kindful_url'], array('query' => $data));
+  drupal_goto($settings['kindful_url'], array('query' => $data));
+  
+  // submit to Kindful
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Process Payment'),
+  );
+
+  return $form;
+}
+
+function commerce_kindful_get_postback() {
+  $postback = FALSE;
+  if (isset($_POST['order_ID'])) {
+    $postback = $_GET + $_POST;
+    unset($postback['q']);
+  }
+  return $postback; 
+}
+
+// processes our transaction hook
+function commerce_kindful_callback() {
+
+  if ($values = commerce_kindful_get_postback() ) {
+    if ($order = commerce_order_load_by_number($values['order']) ) {
+      if ($order->data['payment_redirect_key'] == $values['key']) {
+        commerce_order_delete($order->order_id);
+        return '<p>Thank you for choosing to sponsor a child! Your sponsorship has been successfully setup.</p>';
+      }
+    }
+  }
+  watchdog('commerce_kindful', "There was an error completing order @orderid", array('@orderid' => $_GET['order']), WATCHDOG_ERROR);  
+  return '<p>An Error Occurred. Please contact us.</p>';  
+}
+
+// Get product display nid from product id
+function commerce_kindful_get_referencing_node_id($product_id) {
+
+    // Build query.
+    $query = new EntityFieldQuery;
+    $result = $query->entityCondition('entity_type', 'node', '=')
+      ->entityCondition('bundle', 'sponsorship_display', '=')
+      ->fieldCondition('field_sponsee', 'product_id', $product_id, '=')
+      ->execute();
+    
+    if(!empty($result['node'])) {  
+      foreach($result['node'] as $key => $value) {
+        return $key;
+      }
+    }
+
+  return false;
+}
